@@ -1,6 +1,6 @@
 # GNOME Rounded Blur on NixOS
 
-A flake of [kancko/gnome-rounded-blur](https://kancko/gnome-rounded-blur) for NixOS.  
+A flake of [kancko/gnome-rounded-blur](https://github.com/kancko/gnome-rounded-blur) for NixOS.  
 Refer to the original README for more info on what it is.
 
 Add this repository to your system flake and make its `nixpkgs` input follow yours:
