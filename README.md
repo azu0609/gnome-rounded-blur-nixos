@@ -33,3 +33,18 @@ The package and overlay are also available as `packages.<system>.default` and `o
 
 > [!IMPORTANT]
 > Using only `environment.systemPackages` is not enough for this library, as the NixOS module uses GNOME's `sessionPath` option to configure the runtime search paths.
+
+## Mutter rounded corners (Wayland)
+
+The module can also patch Mutter 50 so native Wayland application windows are
+clipped to a 15px radius and receive the focused/unfocused shadow used by
+libadwaita 1.9. Maximized, fullscreen, and tiled windows remain square. X11 and
+Xwayland windows are unchanged.
+
+```nix
+services.gnome-rounded-blur.roundedCorners.enable = true;
+```
+
+This option is independent of `services.gnome-rounded-blur.enable`; enable both
+when you want the rounded blur library and the compositor patch. Enabling it
+rebuilds Mutter and GNOME Shell from the nixpkgs revision used by your system.

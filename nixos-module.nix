@@ -18,9 +18,37 @@ in
       defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
       description = "The GNOME Rounded Blur package to expose to GNOME Shell.";
     };
+
+    roundedCorners.enable = lib.mkEnableOption ''
+      the Mutter 50 Wayland patch for 15px window corners and libadwaita-style shadows
+    '';
   };
 
-  config = lib.mkIf cfg.enable {
-    services.desktopManager.gnome.sessionPath = [ cfg.package ];
-  };
+  config = lib.mkMerge [
+    (lib.mkIf cfg.enable {
+      services.desktopManager.gnome.sessionPath = [ cfg.package ];
+    })
+
+    (lib.mkIf cfg.roundedCorners.enable {
+      assertions = [
+        {
+          assertion = lib.versions.major pkgs.mutter.version == "50";
+          message = ''
+            services.gnome-rounded-blur.roundedCorners.enable targets Mutter 50,
+            but this nixpkgs provides Mutter ${pkgs.mutter.version}.
+          '';
+        }
+      ];
+
+      nixpkgs.overlays = [
+        (_final: prev: {
+          mutter = prev.mutter.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./patches/mutter-50-rounded-corners.patch
+            ];
+          });
+        })
+      ];
+    })
+  ];
 }

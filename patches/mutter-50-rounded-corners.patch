@@ -1,0 +1,558 @@
+--- a/src/compositor/meta-window-actor-wayland.c
++++ b/src/compositor/meta-window-actor-wayland.c
+@@ -24,6 +24,8 @@
+ #include "compositor/meta-cullable.h"
+ #include "compositor/meta-surface-actor-wayland.h"
+ #include "compositor/meta-window-actor-wayland.h"
++#include "core/meta-window-config-private.h"
++#include "core/window-private.h"
+ #include "meta/meta-window-actor.h"
+ #include "wayland/meta-wayland-actor-surface.h"
+ #include "wayland/meta-wayland-buffer.h"
+@@ -31,6 +33,233 @@
+ #include "wayland/meta-wayland-surface-private.h"
+ #include "wayland/meta-window-wayland.h"
+ 
++#define ROUNDED_CORNER_RADIUS 15.0f
++#define ADWAITA_SHADOW_EXTENT 19.0f
++
++#define ROUNDED_CLIP_FRAGMENT_SHADER_DECLARATIONS                         \
++"uniform vec4 bounds;           // x, y: top left; z, w: bottom right  \n"\
++"uniform float clip_radius;                                            \n"\
++"uniform vec2 pixel_step;                                              \n"\
++"                                                                      \n"\
++"float                                                                 \n"\
++"rounded_rect_coverage (vec2 p)                                        \n"\
++"{                                                                     \n"\
++"  vec2 center = (bounds.xy + bounds.zw) * 0.5;                        \n"\
++"  vec2 half_size = (bounds.zw - bounds.xy) * 0.5;                     \n"\
++"  vec2 q = abs (p - center) - (half_size - vec2 (clip_radius));      \n"\
++"  float distance = length (max (q, vec2 (0.0))) +                    \n"\
++"                   min (max (q.x, q.y), 0.0) - clip_radius;          \n"\
++"                                                                      \n"\
++"  return 1.0 - smoothstep (-0.5, 0.5, distance);                      \n"\
++"}                                                                     \n"
++
++#define ROUNDED_CLIP_FRAGMENT_SHADER_CODE                               \
++"vec2 texture_coord = cogl_tex_coord0_in.xy / pixel_step;             \n"\
++"cogl_color_out *= rounded_rect_coverage (texture_coord);              \n"
++
++typedef struct _MetaRoundedClipEffect
++{
++  ClutterOffscreenEffect parent;
++
++  ClutterActor *actor;
++  graphene_rect_t bounds;
++  float radius;
++} MetaRoundedClipEffect;
++
++typedef ClutterOffscreenEffectClass MetaRoundedClipEffectClass;
++
++G_DEFINE_TYPE (MetaRoundedClipEffect,
++               meta_rounded_clip_effect,
++               CLUTTER_TYPE_OFFSCREEN_EFFECT)
++
++static CoglPipeline *
++meta_rounded_clip_effect_create_pipeline (ClutterOffscreenEffect *effect,
++                                          CoglTexture            *texture)
++{
++  ClutterOffscreenEffectClass *parent_class =
++    CLUTTER_OFFSCREEN_EFFECT_CLASS (meta_rounded_clip_effect_parent_class);
++  CoglPipeline *pipeline;
++  CoglSnippet *snippet;
++
++  pipeline = parent_class->create_pipeline (effect, texture);
++  snippet = cogl_snippet_new (COGL_SNIPPET_HOOK_FRAGMENT,
++                              ROUNDED_CLIP_FRAGMENT_SHADER_DECLARATIONS,
++                              ROUNDED_CLIP_FRAGMENT_SHADER_CODE);
++  cogl_pipeline_add_snippet (pipeline, snippet);
++  g_object_unref (snippet);
++
++  return pipeline;
++}
++
++static void
++meta_rounded_clip_effect_paint_target (ClutterOffscreenEffect *effect,
++                                       ClutterPaintNode       *node,
++                                       ClutterPaintContext    *paint_context)
++{
++  MetaRoundedClipEffect *self = (MetaRoundedClipEffect *) effect;
++  ClutterOffscreenEffectClass *parent_class =
++    CLUTTER_OFFSCREEN_EFFECT_CLASS (meta_rounded_clip_effect_parent_class);
++  CoglPipeline *pipeline = clutter_offscreen_effect_get_pipeline (effect);
++  CoglTexture *texture = clutter_offscreen_effect_get_texture (effect);
++  float actor_width, actor_height;
++  float texture_width, texture_height;
++  float scale_x, scale_y;
++  float shader_bounds[4];
++  float pixel_step[2];
++
++  clutter_actor_get_size (self->actor, &actor_width, &actor_height);
++  texture_width = cogl_texture_get_width (texture);
++  texture_height = cogl_texture_get_height (texture);
++
++  if (actor_width <= 0.0f || actor_height <= 0.0f)
++    return;
++
++  scale_x = texture_width / actor_width;
++  scale_y = texture_height / actor_height;
++  shader_bounds[0] = self->bounds.origin.x * scale_x;
++  shader_bounds[1] = self->bounds.origin.y * scale_y;
++  shader_bounds[2] = (self->bounds.origin.x + self->bounds.size.width) * scale_x;
++  shader_bounds[3] = (self->bounds.origin.y + self->bounds.size.height) * scale_y;
++  pixel_step[0] = 1.0f / texture_width;
++  pixel_step[1] = 1.0f / texture_height;
++
++  cogl_pipeline_set_uniform_float (
++    pipeline,
++    cogl_pipeline_get_uniform_location (pipeline, "bounds"),
++    4, 1, shader_bounds);
++  cogl_pipeline_set_uniform_1f (
++    pipeline,
++    cogl_pipeline_get_uniform_location (pipeline, "clip_radius"),
++    self->radius * MIN (scale_x, scale_y));
++  cogl_pipeline_set_uniform_float (
++    pipeline,
++    cogl_pipeline_get_uniform_location (pipeline, "pixel_step"),
++    2, 1, pixel_step);
++
++  parent_class->paint_target (effect, node, paint_context);
++}
++
++static void
++meta_rounded_clip_effect_set_actor (ClutterActorMeta *meta,
++                                    ClutterActor     *actor)
++{
++  MetaRoundedClipEffect *self = (MetaRoundedClipEffect *) meta;
++  ClutterActorMetaClass *parent_class =
++    CLUTTER_ACTOR_META_CLASS (meta_rounded_clip_effect_parent_class);
++
++  parent_class->set_actor (meta, actor);
++  self->actor = actor;
++}
++
++static void
++meta_rounded_clip_effect_class_init (MetaRoundedClipEffectClass *klass)
++{
++  ClutterActorMetaClass *actor_meta_class = CLUTTER_ACTOR_META_CLASS (klass);
++  ClutterOffscreenEffectClass *offscreen_effect_class =
++    CLUTTER_OFFSCREEN_EFFECT_CLASS (klass);
++
++  actor_meta_class->set_actor = meta_rounded_clip_effect_set_actor;
++  offscreen_effect_class->create_pipeline =
++    meta_rounded_clip_effect_create_pipeline;
++  offscreen_effect_class->paint_target =
++    meta_rounded_clip_effect_paint_target;
++}
++
++static void
++meta_rounded_clip_effect_init (MetaRoundedClipEffect *self)
++{
++}
++
++static void
++meta_rounded_clip_effect_set_bounds (MetaRoundedClipEffect  *self,
++                                     const graphene_rect_t  *bounds,
++                                     float                   radius)
++{
++  if (graphene_rect_equal (&self->bounds, bounds) &&
++      G_APPROX_VALUE (self->radius, radius, FLT_EPSILON))
++    return;
++
++  graphene_rect_init_from_rect (&self->bounds, bounds);
++  self->radius = radius;
++  clutter_effect_queue_repaint (CLUTTER_EFFECT (self));
++}
++
++#define ADWAITA_SHADOW_FRAGMENT_SHADER_DECLARATIONS                     \
++"uniform vec2 frame_size;                                              \n"\
++"uniform float corner_radius;                                          \n"\
++"uniform float geometry_scale;                                         \n"\
++"uniform float focused;                                                \n"\
++"uniform float actor_opacity;                                          \n"\
++"                                                                      \n"\
++"float rounded_rect_distance (vec2 p, float radius, float spread)      \n"\
++"{                                                                     \n"\
++"  vec2 half_size = frame_size * 0.5 + vec2 (spread);                  \n"\
++"  vec2 q = abs (p - frame_size * 0.5) -                              \n"\
++"           (half_size - vec2 (radius + spread));                      \n"\
++"                                                                      \n"\
++"  return length (max (q, vec2 (0.0))) +                              \n"\
++"         min (max (q.x, q.y), 0.0) - radius - spread;                \n"\
++"}                                                                     \n"\
++"                                                                      \n"\
++"float erf_approx (float x)                                            \n"\
++"{                                                                     \n"\
++"  float x_squared = x * x;                                            \n"\
++"  float a = 0.147;                                                    \n"\
++"  float value = 1.0 - exp (-x_squared *                              \n"\
++"                            (1.27323954 + a * x_squared) /             \n"\
++"                            (1.0 + a * x_squared));                    \n"\
++"                                                                      \n"\
++"  return sign (x) * sqrt (max (value, 0.0));                          \n"\
++"}                                                                     \n"\
++"                                                                      \n"\
++"float blurred_coverage (float distance, float blur_radius)            \n"\
++"{                                                                     \n"\
++"  float sigma = blur_radius * 0.5;                                    \n"\
++"  return 0.5 * (1.0 - erf_approx (distance /                          \n"\
++"                                   (1.41421356 * sigma)));             \n"\
++"}                                                                     \n"\
++"                                                                      \n"\
++"float hard_coverage (float distance)                                  \n"\
++"{                                                                     \n"\
++"  return 1.0 - smoothstep (-0.5 * geometry_scale,                     \n"\
++"                           0.5 * geometry_scale, distance);            \n"\
++"}                                                                     \n"
++
++#define ADWAITA_SHADOW_FRAGMENT_SHADER_CODE                            \
++"vec2 shadow_size = frame_size + vec2 (38.0 * geometry_scale);        \n"\
++"vec2 p = cogl_tex_coord0_in.xy * shadow_size -                       \n"\
++"         vec2 (19.0 * geometry_scale);                               \n"\
++"float base_distance = rounded_rect_distance (p, corner_radius, 0.0); \n"\
++"float base_coverage = hard_coverage (base_distance);                 \n"\
++"float first_alpha;                                                    \n"\
++"float second_alpha;                                                   \n"\
++"float edge_alpha;                                                     \n"\
++"                                                                      \n"\
++"if (focused > 0.5)                                                    \n"\
++"  {                                                                   \n"\
++"    first_alpha = 0.15 * blurred_coverage (                           \n"\
++"      rounded_rect_distance (p, corner_radius, 5.0 * geometry_scale),\n"\
++"      14.0 * geometry_scale);                                        \n"\
++"    second_alpha = 0.10 * blurred_coverage (                          \n"\
++"      rounded_rect_distance (p, corner_radius, 2.0 * geometry_scale),\n"\
++"      5.0 * geometry_scale);                                         \n"\
++"  }                                                                   \n"\
++"else                                                                  \n"\
++"  {                                                                   \n"\
++"    first_alpha = 0.0;                                                \n"\
++"    second_alpha = 0.08 * blurred_coverage (                          \n"\
++"      rounded_rect_distance (p, corner_radius, 5.0 * geometry_scale),\n"\
++"      10.0 * geometry_scale);                                        \n"\
++"  }                                                                   \n"\
++"                                                                      \n"\
++"edge_alpha = 0.05 * hard_coverage (                                   \n"\
++"  rounded_rect_distance (p, corner_radius, 1.0 * geometry_scale));   \n"\
++"float alpha = 1.0 - (1.0 - first_alpha) *                            \n"\
++"                    (1.0 - second_alpha) *                           \n"\
++"                    (1.0 - edge_alpha);                              \n"\
++"alpha *= (1.0 - base_coverage) * actor_opacity;                       \n"\
++"cogl_color_out = vec4 (0.0, 0.0, 0.0, alpha);                        \n"
++
+ struct _MetaSurfaceContainerActorWayland
+ {
+   ClutterActor parent;
+@@ -51,6 +280,8 @@
+   MetaWindowActor parent;
+   ClutterActor *background;
+   MetaSurfaceContainerActorWayland *surface_container;
++  MetaRoundedClipEffect *rounded_clip_effect;
++  CoglPipeline *shadow_pipeline;
+   gulong highest_scale_monitor_handler_id;
+   gboolean needs_sync;
+ };
+@@ -62,6 +293,204 @@
+                          G_IMPLEMENT_INTERFACE (META_TYPE_CULLABLE,
+                                                 cullable_iface_init))
+ 
++static gboolean
++should_round_window (MetaWindowActor *window_actor)
++{
++  MetaWindow *window = meta_window_actor_get_meta_window (window_actor);
++
++  if (!window || !meta_window_config_is_floating (window->config))
++    return FALSE;
++
++  switch (meta_window_get_window_type (window))
++    {
++    case META_WINDOW_NORMAL:
++    case META_WINDOW_DIALOG:
++    case META_WINDOW_MODAL_DIALOG:
++    case META_WINDOW_UTILITY:
++      return TRUE;
++
++    default:
++      return FALSE;
++    }
++}
++
++static void
++sync_rounded_clip (MetaWindowActorWayland *self)
++{
++  MetaWindowActor *window_actor = META_WINDOW_ACTOR (self);
++  MetaWindow *window = meta_window_actor_get_meta_window (window_actor);
++  ClutterActor *surface_container = CLUTTER_ACTOR (self->surface_container);
++  gboolean enabled = should_round_window (window_actor);
++  int geometry_scale = meta_window_actor_get_geometry_scale (window_actor);
++  MtkRectangle buffer_rect;
++
++  meta_window_get_buffer_rect (window, &buffer_rect);
++  clutter_actor_set_size (surface_container,
++                          buffer_rect.width / geometry_scale,
++                          buffer_rect.height / geometry_scale);
++
++  if (enabled)
++    {
++      MtkRectangle frame_rect;
++      graphene_rect_t clip_bounds;
++
++      meta_window_get_frame_rect (window, &frame_rect);
++      graphene_rect_init (&clip_bounds,
++                          (frame_rect.x - buffer_rect.x) / geometry_scale,
++                          (frame_rect.y - buffer_rect.y) / geometry_scale,
++                          frame_rect.width / geometry_scale,
++                          frame_rect.height / geometry_scale);
++      meta_rounded_clip_effect_set_bounds (self->rounded_clip_effect,
++                                           &clip_bounds,
++                                           ROUNDED_CORNER_RADIUS);
++    }
++
++  if (clutter_actor_meta_get_enabled (
++        CLUTTER_ACTOR_META (self->rounded_clip_effect)) != enabled)
++    {
++      clutter_actor_meta_set_enabled (
++        CLUTTER_ACTOR_META (self->rounded_clip_effect), enabled);
++    }
++
++  clutter_actor_set_clip_to_allocation (surface_container, enabled);
++}
++
++static void
++ensure_shadow_pipeline (MetaWindowActorWayland *self,
++                        CoglFramebuffer        *framebuffer)
++{
++  CoglSnippet *snippet;
++
++  if (self->shadow_pipeline)
++    return;
++
++  self->shadow_pipeline =
++    cogl_pipeline_new (cogl_framebuffer_get_context (framebuffer));
++  cogl_pipeline_set_layer_null_texture (self->shadow_pipeline, 0);
++  cogl_pipeline_set_blend (
++    self->shadow_pipeline,
++    "RGBA = ADD (SRC_COLOR, DST_COLOR * (1 - SRC_COLOR[A]))",
++    NULL);
++
++  snippet = cogl_snippet_new (COGL_SNIPPET_HOOK_FRAGMENT,
++                              ADWAITA_SHADOW_FRAGMENT_SHADER_DECLARATIONS,
++                              ADWAITA_SHADOW_FRAGMENT_SHADER_CODE);
++  cogl_pipeline_add_snippet (self->shadow_pipeline, snippet);
++  g_object_unref (snippet);
++}
++
++static void
++paint_adwaita_shadow (MetaWindowActorWayland *self,
++                      ClutterPaintContext    *paint_context)
++{
++  MetaWindowActor *window_actor = META_WINDOW_ACTOR (self);
++  MetaWindow *window = meta_window_actor_get_meta_window (window_actor);
++  ClutterActor *actor = CLUTTER_ACTOR (self);
++  CoglFramebuffer *framebuffer;
++  MtkRectangle frame_rect;
++  MtkRectangle buffer_rect;
++  int geometry_scale;
++  float frame_size[2];
++  float extent;
++  float x;
++  float y;
++  float actor_opacity;
++
++  if (!should_round_window (window_actor))
++    return;
++
++  framebuffer = clutter_paint_context_get_framebuffer (paint_context);
++  ensure_shadow_pipeline (self, framebuffer);
++
++  meta_window_get_frame_rect (window, &frame_rect);
++  meta_window_get_buffer_rect (window, &buffer_rect);
++  geometry_scale = meta_window_actor_get_geometry_scale (window_actor);
++  extent = ADWAITA_SHADOW_EXTENT * geometry_scale;
++  x = frame_rect.x - buffer_rect.x;
++  y = frame_rect.y - buffer_rect.y;
++  frame_size[0] = frame_rect.width;
++  frame_size[1] = frame_rect.height;
++  actor_opacity =
++    (clutter_actor_get_paint_opacity (actor) / 255.0f) *
++    (window->opacity / 255.0f);
++
++  cogl_pipeline_set_uniform_float (
++    self->shadow_pipeline,
++    cogl_pipeline_get_uniform_location (self->shadow_pipeline, "frame_size"),
++    2, 1, frame_size);
++  cogl_pipeline_set_uniform_1f (
++    self->shadow_pipeline,
++    cogl_pipeline_get_uniform_location (self->shadow_pipeline,
++                                        "corner_radius"),
++    ROUNDED_CORNER_RADIUS * geometry_scale);
++  cogl_pipeline_set_uniform_1f (
++    self->shadow_pipeline,
++    cogl_pipeline_get_uniform_location (self->shadow_pipeline,
++                                        "geometry_scale"),
++    geometry_scale);
++  cogl_pipeline_set_uniform_1f (
++    self->shadow_pipeline,
++    cogl_pipeline_get_uniform_location (self->shadow_pipeline, "focused"),
++    meta_window_appears_focused (window) ? 1.0f : 0.0f);
++  cogl_pipeline_set_uniform_1f (
++    self->shadow_pipeline,
++    cogl_pipeline_get_uniform_location (self->shadow_pipeline,
++                                        "actor_opacity"),
++    actor_opacity);
++
++  cogl_framebuffer_draw_textured_rectangle (
++    framebuffer,
++    self->shadow_pipeline,
++    x - extent,
++    y - extent,
++    x + frame_rect.width + extent,
++    y + frame_rect.height + extent,
++    0.0f, 0.0f, 1.0f, 1.0f);
++}
++
++static void
++meta_window_actor_wayland_paint (ClutterActor        *actor,
++                                 ClutterPaintContext *paint_context)
++{
++  paint_adwaita_shadow (META_WINDOW_ACTOR_WAYLAND (actor), paint_context);
++
++  CLUTTER_ACTOR_CLASS (meta_window_actor_wayland_parent_class)->paint (
++    actor, paint_context);
++}
++
++static gboolean
++meta_window_actor_wayland_get_paint_volume (ClutterActor       *actor,
++                                            ClutterPaintVolume *volume)
++{
++  MetaWindowActorWayland *self = META_WINDOW_ACTOR_WAYLAND (actor);
++  MetaWindowActor *window_actor = META_WINDOW_ACTOR (self);
++  ClutterActorClass *parent_class =
++    CLUTTER_ACTOR_CLASS (meta_window_actor_wayland_parent_class);
++
++  if (!parent_class->get_paint_volume (actor, volume))
++    return FALSE;
++
++  if (should_round_window (window_actor))
++    {
++      MetaWindow *window = meta_window_actor_get_meta_window (window_actor);
++      MtkRectangle frame_rect;
++      MtkRectangle buffer_rect;
++      int geometry_scale = meta_window_actor_get_geometry_scale (window_actor);
++      float extent = ADWAITA_SHADOW_EXTENT * geometry_scale;
++      ClutterActorBox shadow_box;
++
++      meta_window_get_frame_rect (window, &frame_rect);
++      meta_window_get_buffer_rect (window, &buffer_rect);
++      shadow_box.x1 = frame_rect.x - buffer_rect.x - extent;
++      shadow_box.y1 = frame_rect.y - buffer_rect.y - extent;
++      shadow_box.x2 = shadow_box.x1 + frame_rect.width + 2 * extent;
++      shadow_box.y2 = shadow_box.y1 + frame_rect.height + 2 * extent;
++      clutter_paint_volume_union_box (volume, &shadow_box);
++    }
++
++  return TRUE;
++}
++
+ typedef struct _SurfaceTreeTraverseData
+ {
+   ClutterActor *surface_container;
+@@ -85,6 +514,15 @@
+ surface_container_cull_unobscured (MetaCullable *cullable,
+                                    MtkRegion    *unobscured_region)
+ {
++  MetaSurfaceContainerActorWayland *surface_container =
++    META_SURFACE_CONTAINER_ACTOR_WAYLAND (cullable);
++
++  /* The client opaque regions are rectangular and include the pixels that the
++   * compositor removes at the corners.  Don't let them cull the actors below
++   * the window while the rounded clip is active. */
++  if (should_round_window (surface_container->window_actor))
++    unobscured_region = NULL;
++
+   meta_cullable_cull_unobscured_children (cullable, unobscured_region);
+ }
+ 
+@@ -92,6 +530,12 @@
+ surface_container_cull_redraw_clip (MetaCullable *cullable,
+                                     MtkRegion    *clip_region)
+ {
++  MetaSurfaceContainerActorWayland *surface_container =
++    META_SURFACE_CONTAINER_ACTOR_WAYLAND (cullable);
++
++  if (should_round_window (surface_container->window_actor))
++    clip_region = NULL;
++
+   meta_cullable_cull_redraw_clip_children (cullable, clip_region);
+ }
+ 
+@@ -357,6 +801,13 @@
+   ClutterActorBox window_box;
+   ClutterActorBox surface_box;
+ 
++  if (should_round_window (actor))
++    {
++      meta_topic (META_DEBUG_RENDER,
++                  "Rounded Wayland window is not a scanout candidate");
++      return NULL;
++    }
++
+   if (clutter_actor_get_last_child (CLUTTER_ACTOR (self)) != surface_container)
+     {
+       meta_topic (META_DEBUG_RENDER,
+@@ -471,6 +922,7 @@
+                                         ClutterStageView *stage_view,
+                                         ClutterFrame     *frame)
+ {
++  sync_rounded_clip (META_WINDOW_ACTOR_WAYLAND (actor));
+ }
+ 
+ static void
+@@ -654,6 +1106,7 @@
+   MetaWindowActorWayland *self = META_WINDOW_ACTOR_WAYLAND (actor);
+ 
+   self->needs_sync = !do_sync_geometry (self);
++  sync_rounded_clip (self);
+ }
+ 
+ static void
+@@ -670,6 +1123,8 @@
+       do_sync_geometry (self);
+       self->needs_sync = FALSE;
+     }
++
++  sync_rounded_clip (self);
+ }
+ 
+ static void
+@@ -682,6 +1137,7 @@
+ 
+   g_clear_signal_handler (&self->highest_scale_monitor_handler_id,
+                           window);
++  g_clear_object (&self->shadow_pipeline);
+ 
+   parent_class->dispose (object);
+ }
+@@ -721,6 +1177,9 @@
+   window_actor_class->is_single_surface_actor = meta_window_actor_wayland_is_single_surface_actor;
+ 
+   clutter_actor_class->map = meta_window_actor_wayland_map;
++  clutter_actor_class->paint = meta_window_actor_wayland_paint;
++  clutter_actor_class->get_paint_volume =
++    meta_window_actor_wayland_get_paint_volume;
+ 
+   object_class->constructed = meta_window_actor_wayland_constructed;
+   object_class->dispose = meta_window_actor_wayland_dispose;
+@@ -730,6 +1189,12 @@
+ meta_window_actor_wayland_init (MetaWindowActorWayland *self)
+ {
+   self->surface_container = surface_container_new (META_WINDOW_ACTOR (self));
++  self->rounded_clip_effect =
++    g_object_new (meta_rounded_clip_effect_get_type (), NULL);
++  clutter_actor_meta_set_enabled (
++    CLUTTER_ACTOR_META (self->rounded_clip_effect), FALSE);
++  clutter_actor_add_effect (CLUTTER_ACTOR (self->surface_container),
++                            CLUTTER_EFFECT (self->rounded_clip_effect));
+ 
+   clutter_actor_add_child (CLUTTER_ACTOR (self),
+                            CLUTTER_ACTOR (self->surface_container));
